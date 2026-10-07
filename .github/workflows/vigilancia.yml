@@ -1,0 +1,88 @@
+# Vigilancia de Albic Cloud: cada 5 minutos comprueba que la aplicación, el
+# repositorio de los DeCA, la copia de contingencia y el campus responden.
+# Si algo falla tres veces seguidas (con 20 s entre intentos) abre un aviso
+# («issue») en este repositorio, y GitHub lo manda por correo al dueño. Cuando
+# todo vuelve a responder, lo dice en el aviso y lo cierra. No se repite el
+# aviso mientras siga abierto.
+#
+# Está en un repositorio público aparte porque ahí los minutos de Actions no
+# se cobran; en el de la aplicación (privado) se gastarían los del despliegue.
+# Solo consulta direcciones públicas: no lleva claves ni datos.
+name: Vigilancia
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: vigilancia
+  cancel-in-progress: false
+
+jobs:
+  comprobar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Comprobar los servicios
+        id: c
+        shell: bash
+        run: |
+          Z=00000000000000000000000000000000
+          fallos=""
+          prueba() {   # nombre, url, códigos que valen
+            local codigo=000 i
+            for i in 1 2 3; do
+              codigo=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$2" || true)
+              case " $3 " in *" $codigo "*) echo "OK   $1 ($codigo)"; return 0;; esac
+              [ "$i" -lt 3 ] && sleep 20
+            done
+            echo "MAL  $1 ($codigo)"
+            fallos="${fallos}- **$1**: responde ${codigo} — $2"$'\n'
+          }
+          prueba "La aplicación (app.albic.es)"               "https://app.albic.es/version.txt"            "200"
+          prueba "El servidor y la sesión (api/me.php)"        "https://app.albic.es/api/me.php"             "200"
+          prueba "El repositorio de los DeCA (api/deca.php)"   "https://app.albic.es/api/deca.php?d=$Z"      "404"
+          prueba "cloud.albic.es"                              "https://cloud.albic.es/version.txt"          "200"
+          prueba "La copia de contingencia de los DeCA"        "https://cloud.albic.es/deca-copia/$Z"        "404"
+          prueba "El campus (formacion.albic.es)"              "https://formacion.albic.es/"                 "200 301 302"
+          {
+            echo 'fallos<<FIN_FALLOS'
+            printf '%s' "$fallos"
+            echo 'FIN_FALLOS'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Abrir o cerrar el aviso
+        uses: actions/github-script@v7
+        env:
+          FALLOS: ${{ steps.c.outputs.fallos }}
+        with:
+          script: |
+            const fallos = (process.env.FALLOS || '').trim();
+            const { owner, repo } = context.repo;
+            const hora = new Date().toLocaleString('es-ES', { timeZone: 'Europe/Madrid', dateStyle: 'short', timeStyle: 'short' });
+            const abiertos = (await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 20 }))
+              .data.filter(i => !i.pull_request && i.title.startsWith('Albic no responde'));
+            const abierto = abiertos[0];
+            if (fallos) {
+              if (abierto) { core.info('Sigue fallando; el aviso ya está abierto: #' + abierto.number); return; }
+              const i = await github.rest.issues.create({
+                owner, repo,
+                title: 'Albic no responde (' + hora + ')',
+                body: 'La vigilancia automática ha encontrado esto a las ' + hora + ' (hora de España), tras tres intentos:\n\n'
+                    + fallos + '\n\nSe vuelve a comprobar cada 5 minutos. Este aviso se cierra solo cuando todo responda.'
+                    + '\n\nSi falla el repositorio de los DeCA, los conductores pueden enseñar en un control el PDF o el QR guardados, '
+                    + 'y la copia de contingencia de cloud.albic.es sigue sirviendo los PDF.'
+              });
+              core.warning('Aviso abierto: #' + i.data.number);
+            } else if (abierto) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: abierto.number, body: 'Todo responde de nuevo (' + hora + ').' });
+              await github.rest.issues.update({ owner, repo, issue_number: abierto.number, state: 'closed' });
+              core.info('Aviso #' + abierto.number + ' cerrado: todo responde.');
+            } else {
+              core.info('Todo responde.');
+            }
